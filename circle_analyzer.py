@@ -1,27 +1,23 @@
 #!/usr/bin/env python3
 """
-circle_analyzer.py
+circle_analyzer_simple.py
 
 Detects concentric circle pairs (inner circle inside outer circle) in images,
-filters out pairs that are out of focus (blurry), measures the area of each
-circle, and outputs the inner/outer area ratio.
+measures the area of each circle, and outputs the inner/outer area ratio.
+(No focus/blur filtering -- this version just tries to find and pair every
+circle it can, so we can see what's actually being detected.)
 
 Usage:
-    python3 circle_analyzer.py <input_path> [options]
+    python3 circle_analyzer_simple.py <input_path> [options]
 
     <input_path> can be a single image file or a directory of images.
 
-Key options (all have sensible defaults, tune as needed for your images):
-    --min-radius, --max-radius   Expected circle radius range in pixels
-    --min-dist                   Minimum distance between detected circle centers
-    --param1, --param2           Hough transform sensitivity params (see OpenCV docs)
-    --center-tol                 Max center offset (px) to consider two circles concentric
-    --focus-threshold             Laplacian-variance cutoff below which a circle is "blurry"
-    --outdir                     Where to write CSV + annotated images
-
 Output:
-    - results.csv: one row per accepted circle pair with areas + ratio
-    - <image>_annotated.png: visual showing kept (green) vs rejected (red) pairs
+    - results.csv: one row per matched circle pair with areas + ratio
+    - <image>_annotated.png: all detected circles drawn on the image
+      (green = matched into a pair, yellow = detected but unpaired)
+    - prints raw detection counts to the terminal so you can see what's
+      happening even if nothing gets paired
 """
 
 import cv2
@@ -36,7 +32,6 @@ IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
 
 
 def detect_circles(gray, dp, min_dist, param1, param2, min_radius, max_radius):
-    """Run Hough Circle Transform, return list of (x, y, r) ints."""
     blurred = cv2.medianBlur(gray, 5)
     circles = cv2.HoughCircles(
         blurred,
@@ -54,25 +49,12 @@ def detect_circles(gray, dp, min_dist, param1, param2, min_radius, max_radius):
     return [(int(x), int(y), int(r)) for x, y, r in circles]
 
 
-def focus_score(gray, x, y, r):
-    """
-    Sharpness metric for the region around a circle, using the variance of
-    the Laplacian. Higher = sharper/more in-focus, lower = blurrier.
-    """
-    x0, y0 = max(0, x - r), max(0, y - r)
-    x1, y1 = min(gray.shape[1], x + r), min(gray.shape[0], y + r)
-    roi = gray[y0:y1, x0:x1]
-    if roi.size == 0:
-        return 0.0
-    return float(cv2.Laplacian(roi, cv2.CV_64F).var())
-
-
 def group_concentric(circles, center_tol):
     """
     Pair up circles that share (approximately) the same center, matching
     each larger circle to the nearest smaller circle within center_tol.
-    Returns list of (outer, inner) tuples, each a (x, y, r) tuple.
-    Unpaired circles are ignored (need both an inner and outer to form a ratio).
+    Returns (pairs, unpaired) where pairs is a list of (outer, inner)
+    tuples and unpaired is a list of leftover (x, y, r) circles.
     """
     circles_sorted = sorted(circles, key=lambda c: c[2], reverse=True)
     used = set()
@@ -93,7 +75,8 @@ def group_concentric(circles, center_tol):
             pairs.append((outer, circles_sorted[best_j]))
             used.add(i)
             used.add(best_j)
-    return pairs
+    unpaired = [c for idx, c in enumerate(circles_sorted) if idx not in used]
+    return pairs, unpaired
 
 
 def process_image(path, args, csv_writer):
@@ -112,27 +95,22 @@ def process_image(path, args, csv_writer):
         min_radius=args.min_radius,
         max_radius=args.max_radius,
     )
-    pairs = group_concentric(circles, center_tol=args.center_tol)
+    print(f"  [debug] {os.path.basename(path)}: raw circles detected = {len(circles)}")
+
+    pairs, unpaired = group_concentric(circles, center_tol=args.center_tol)
+    print(f"  [debug] {os.path.basename(path)}: pairs = {len(pairs)}, unpaired = {len(unpaired)}")
 
     annotated = img.copy()
-    kept = 0
     fname = os.path.basename(path)
 
     for idx, (outer, inner) in enumerate(pairs):
-        f_outer = focus_score(gray, *outer)
-        f_inner = focus_score(gray, *inner)
-        is_focused = f_outer >= args.focus_threshold and f_inner >= args.focus_threshold
-
-        color = (0, 200, 0) if is_focused else (0, 0, 220)  # green vs red (BGR)
+        color = (0, 200, 0)  # green
         cv2.circle(annotated, (outer[0], outer[1]), outer[2], color, 2)
         cv2.circle(annotated, (inner[0], inner[1]), inner[2], color, 2)
         cv2.putText(
             annotated, str(idx), (outer[0] - 8, outer[1] + 5),
             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2, cv2.LINE_AA,
         )
-
-        if not is_focused:
-            continue
 
         area_outer = np.pi * (outer[2] ** 2)
         area_inner = np.pi * (inner[2] ** 2)
@@ -146,16 +124,17 @@ def process_image(path, args, csv_writer):
             "outer_area": round(area_outer, 2),
             "inner_area": round(area_inner, 2),
             "inner_outer_ratio": round(ratio, 4),
-            "outer_focus_score": round(f_outer, 1),
-            "inner_focus_score": round(f_inner, 1),
         })
-        kept += 1
+
+    # draw unpaired circles in yellow so you can see what got detected
+    # but didn't find a match
+    for (x, y, r) in unpaired:
+        cv2.circle(annotated, (x, y), r, (0, 255, 255), 1)
 
     out_path = os.path.join(args.outdir, f"{os.path.splitext(fname)[0]}_annotated.png")
     cv2.imwrite(out_path, annotated)
-    print(f"  {fname}: {len(circles)} circles detected, {len(pairs)} pairs, "
-          f"{kept} kept as in-focus -> {out_path}")
-    return kept
+    print(f"  -> wrote {out_path}")
+    return len(pairs)
 
 
 def gather_images(input_path):
@@ -170,21 +149,20 @@ def gather_images(input_path):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Analyze concentric circle images.")
+    parser = argparse.ArgumentParser(description="Detect and pair concentric circles (no focus filtering).")
     parser.add_argument("input_path", help="Image file or directory of images")
     parser.add_argument("--outdir", default="output", help="Output directory")
     parser.add_argument("--dp", type=float, default=1.2, help="Hough dp param")
     parser.add_argument("--min-dist", type=int, default=20, dest="min_dist",
                          help="Min distance between detected circle centers")
     parser.add_argument("--param1", type=float, default=50)
-    parser.add_argument("--param2", type=float, default=30)
+    parser.add_argument("--param2", type=float, default=30,
+                         help="Lower = more circles detected (more false positives too)")
     parser.add_argument("--min-radius", type=int, default=5, dest="min_radius")
     parser.add_argument("--max-radius", type=int, default=0, dest="max_radius",
                          help="0 = no upper limit")
-    parser.add_argument("--center-tol", type=float, default=10, dest="center_tol",
+    parser.add_argument("--center-tol", type=float, default=15, dest="center_tol",
                          help="Max center offset (px) for two circles to count as concentric")
-    parser.add_argument("--focus-threshold", type=float, default=100.0, dest="focus_threshold",
-                         help="Laplacian variance cutoff; below this a circle is 'blurry'")
     args = parser.parse_args()
 
     os.makedirs(args.outdir, exist_ok=True)
@@ -200,17 +178,16 @@ def main():
             "outer_x", "outer_y", "outer_r",
             "inner_x", "inner_y", "inner_r",
             "outer_area", "inner_area", "inner_outer_ratio",
-            "outer_focus_score", "inner_focus_score",
         ]
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
 
-        total_kept = 0
+        total_pairs = 0
         print(f"Processing {len(images)} image(s)...")
         for path in images:
-            total_kept += process_image(path, args, writer)
+            total_pairs += process_image(path, args, writer)
 
-    print(f"\nDone. {total_kept} in-focus circle pair(s) written to {csv_path}")
+    print(f"\nDone. {total_pairs} circle pair(s) written to {csv_path}")
 
 
 if __name__ == "__main__":
